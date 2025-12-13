@@ -16,9 +16,11 @@ DEFAULT_PREFIX = "predictions/"
 DEFAULT_API_URL = "https://zmjbu0xzc7.execute-api.us-east-1.amazonaws.com/Prod/predict-stream"
 FALLBACK_MODEL = "GradientBoosting"
 
-
-# ---------- AWS SESSION (works locally & on Streamlit Cloud) ----------
 def get_s3_client():
+    """
+    If running on Streamlit Cloud with secrets configured, use those.
+    Otherwise fall back to default boto3 client (for local/SageMaker).
+    """
     if "aws" in st.secrets:
         aws_cfg = st.secrets["aws"]
         session = boto3.Session(
@@ -64,6 +66,10 @@ def load_s3_predictions(bucket: str, prefix: str) -> pd.DataFrame:
 
 
 def generate_synthetic_student() -> dict:
+    """
+    Generate one synthetic student with realistic fields.
+    (Treat G3 as the "true" hidden value; Lambda will output predicted_G3.)
+    """
     student = {
         "id": str(uuid.uuid4()),
         "school": random.choice(["GP", "MS"]),
@@ -212,13 +218,26 @@ def main():
         if not api_url:
             st.error("Please enter API URL.")
         else:
+            success = 0
+            failed = 0
             with st.spinner(
                 f"Generating {n_new} students and sending to model: {model_for_generation}..."
             ):
                 for _ in range(int(n_new)):
                     student = generate_synthetic_student()
-                    call_api_for_student(api_url, student, model_for_generation)
-            st.success(f"Generated {n_new} students with model: {model_for_generation}")
+                    status_code, _ = call_api_for_student(api_url, student, model_for_generation)
+                    if 200 <= status_code < 300:
+                        success += 1
+                    else:
+                        failed += 1
+
+            st.success(f"API calls completed. Success: {success}, Failed: {failed}")
+            if failed > 0:
+                st.warning(
+                    "Some requests failed – only successful calls will appear in S3. "
+                    "Check Lambda/API logs if the failure count is high."
+                )
+
             load_s3_predictions.clear()
             df_raw = load_s3_predictions(bucket, prefix)
             inferred_best_model = infer_best_model_from_s3(df_raw) if not df_raw.empty else inferred_best_model
@@ -235,20 +254,8 @@ def main():
         st.warning(f"No prediction data found in s3://{bucket}/{prefix}")
         return
 
-    # For the dashboard, use only the best model’s records (if column exists)
+    # From here on: use ALL records from S3 (all models), not filtered
     df = df_raw.copy()
-    if "model_used" in df.columns:
-        # Prefer inferred best model; if still None, just choose the most frequent model
-        best_model_for_view = inferred_best_model
-        if best_model_for_view is None:
-            best_model_for_view = df["model_used"].value_counts().idxmax()
-        df = df[df["model_used"] == best_model_for_view].copy()
-    else:
-        best_model_for_view = model_for_generation  # whatever we’re using for generation
-
-    if df.empty:
-        st.warning("No records available for the selected best model.")
-        return
 
     # Treat as prediction-only: drop true G3 columns from what we show
     for col in ["true_G3", "G3"]:
@@ -267,6 +274,7 @@ def main():
         "absences",
         "predicted_G3",
         "prediction_time",
+        # note: we intentionally skip 'model_used' to not show it row-by-row
     ]:
         if c in df.columns:
             display_cols.append(c)
@@ -292,6 +300,8 @@ def main():
     else:
         at_risk_mask = pd.Series([False] * len(df_display), index=df_display.index)
         at_risk_count = 0
+
+    best_model_for_view = inferred_best_model or model_for_generation
 
     col1, col2, col3 = st.columns(3)
 
@@ -367,7 +377,7 @@ def main():
         st.plotly_chart(fig_low, use_container_width=True)
 
     # ------- Factors Affecting Low Predicted G3 -------
-    st.subheader("Factors Affecting Low Predicted G3 Scores")
+    st.subheader("📌 Factors Affecting Low Predicted G3 Scores")
 
     if at_risk_df.empty or "Predicted G3" not in at_risk_df.columns:
         st.info("No at-risk students available — cannot compute influencing factors.")
