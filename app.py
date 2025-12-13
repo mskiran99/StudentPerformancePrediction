@@ -1,5 +1,4 @@
 # app.py
-
 import streamlit as st
 import boto3
 import json
@@ -18,9 +17,28 @@ DEFAULT_API_URL = "https://zmjbu0xzc7.execute-api.us-east-1.amazonaws.com/Prod/p
 # -----------------------------
 
 
+# ---------- AWS SESSION (for Streamlit Cloud) ----------
+def get_s3_client():
+    """
+    If running on Streamlit Cloud with secrets configured, use those.
+    Otherwise fall back to default boto3 client (for local/SageMaker).
+    """
+    if "aws" in st.secrets:
+        aws_cfg = st.secrets["aws"]
+        session = boto3.Session(
+            aws_access_key_id=aws_cfg["AWS_ACCESS_KEY_ID"],
+            aws_secret_access_key=aws_cfg["AWS_SECRET_ACCESS_KEY"],
+            region_name=aws_cfg.get("AWS_REGION", "us-east-1"),
+        )
+        return session.client("s3")
+    else:
+        # local environment: use default credentials
+        return boto3.client("s3")
+
+
 @st.cache_data
 def load_s3_predictions(bucket: str, prefix: str) -> pd.DataFrame:
-    s3 = boto3.client("s3")
+    s3 = get_s3_client()
     resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
     contents = resp.get("Contents", [])
     if not contents:
@@ -196,7 +214,6 @@ End‑to‑end pipeline:
             if metrics:
                 metrics_df = pd.DataFrame(metrics).sort_values("rmse")
                 best_model = metrics_df.iloc[0]["model"]
-
                 st.success(
                     f"Best model **right now (based on S3 data)**: **{best_model}**"
                 )
@@ -274,7 +291,6 @@ End‑to‑end pipeline:
                     title="Correlation with predicted G3 (at‑risk subset)",
                 )
                 st.plotly_chart(fig_corr, use_container_width=True)
-
     else:
         st.error("No 'predicted_G3' column found in S3 data.")
 
