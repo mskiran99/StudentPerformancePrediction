@@ -14,13 +14,10 @@ import joblib
 import requests
 import os
 
-# ===================== CONFIG (defaults) =====================
 
-# Where predictions (JSON) are stored
 DEFAULT_BUCKET = "cloudprojectmodel"
 DEFAULT_PREFIX = "predictions/"
 
-# Your API Gateway endpoint that calls lambda_store_predictions
 DEFAULT_API_URL = "https://zmjbu0xzc7.execute-api.us-east-1.amazonaws.com/Prod/predict-stream"
 
 # Where your two trained models (.pkl) are stored in S3
@@ -28,47 +25,24 @@ DEFAULT_MODEL_BUCKET = "cloudprojectmodel"
 DEFAULT_RF_MODEL_KEY = "model/student_g3_model.pkl"
 DEFAULT_GB_MODEL_KEY = "model/student_g3_gb_predict.pkl"
 
-# ===================== LOAD SECRETS (if present) =====================
-
-# .streamlit/secrets.toml should look like:
-# [aws]
-# AWS_ACCESS_KEY_ID = "..."
-# AWS_SECRET_ACCESS_KEY = "..."
-# AWS_REGION = "us-east-1"
-#
-# [app]
-# API_URL = "https://.../Prod/predict-stream"
-# S3_BUCKET = "cloudprojectmodel"
-# S3_PREFIX = "predictions/"
-
 try:
-    # AWS credentials from secrets -> environment variables for boto3
+    # AWS credentials from secrets 
     if "aws" in st.secrets:
         aws_conf = st.secrets["aws"]
         os.environ["AWS_ACCESS_KEY_ID"] = aws_conf["AWS_ACCESS_KEY_ID"]
         os.environ["AWS_SECRET_ACCESS_KEY"] = aws_conf["AWS_SECRET_ACCESS_KEY"]
         os.environ["AWS_DEFAULT_REGION"] = aws_conf.get("AWS_REGION", "us-east-1")
 
-    # Optional: override defaults from [app] section
     if "app" in st.secrets:
         app_conf = st.secrets["app"]
         DEFAULT_API_URL = app_conf.get("API_URL", DEFAULT_API_URL)
         DEFAULT_BUCKET = app_conf.get("S3_BUCKET", DEFAULT_BUCKET)
         DEFAULT_PREFIX = app_conf.get("S3_PREFIX", DEFAULT_PREFIX)
 except Exception:
-    # If secrets missing / misconfigured, just keep defaults
     pass
-
-# ===================== HELPERS =====================
-
 
 @st.cache_data
 def load_s3_predictions(bucket: str, prefix: str) -> pd.DataFrame:
-    """Load all prediction JSONs from S3 into a DataFrame.
-    Supports:
-    - Old format: each object is a single dict
-    - New format: each object is a list of dicts (batch)
-    """
     s3 = boto3.client("s3")
     resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
 
@@ -81,24 +55,21 @@ def load_s3_predictions(bucket: str, prefix: str) -> pd.DataFrame:
     for obj in contents:
         key = obj["Key"]
         if key.endswith("/"):
-            continue  # skip "folder" keys
+            continue  
 
         body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
 
         try:
             data = json.loads(body)
         except Exception:
-            # skip badly formatted JSON
             continue
 
-        # New format: file contains a list of dicts
         if isinstance(data, list):
             for item in data:
                 if isinstance(item, dict):
                     rows.append(item)
             continue
 
-        # Old format: file contains a single dict
         if isinstance(data, dict):
             rows.append(data)
 
@@ -111,6 +82,30 @@ def load_s3_predictions(bucket: str, prefix: str) -> pd.DataFrame:
 
     return df
 
+
+def clear_s3_predictions(bucket: str, prefix: str) -> int:
+    """
+    Delete all objects under the given bucket/prefix.
+    Returns the number of deleted objects.
+    """
+    s3 = boto3.client("s3")
+    deleted_count = 0
+
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        objects = page.get("Contents", [])
+        if not objects:
+            continue
+
+        # Build delete batch
+        to_delete = [{"Key": obj["Key"]} for obj in objects]
+        s3.delete_objects(
+            Bucket=bucket,
+            Delete={"Objects": to_delete, "Quiet": True},
+        )
+        deleted_count += len(to_delete)
+
+    return deleted_count
 
 
 @st.cache_resource
@@ -188,41 +183,22 @@ def generate_synthetic_student() -> dict:
 
     student["G1"] = G1
     student["G2"] = G2
-    student["G3"] = G3  # synthetic true label (not shown to admins)
+    student["G3"] = G3  
 
     return student
 
 
 def send_predictions_via_api(api_url: str, records: list) -> tuple[int, str]:
-    """Send predicted records to Lambda via API Gateway (ONE API CALL)."""
+    """Send predicted records to Lambda via API Gateway."""
     payload = {"records": records}
     resp = requests.post(api_url, json=payload, timeout=60)
     return resp.status_code, resp.text
 
-
-# ===================== MAIN APP =====================
-
-
 def main():
     st.title("Student G3 Prediction Dashboard (Cloud Project)")
 
-    st.markdown(
-        """
-This dashboard uses **two ML models** (stored in S3) to predict students'
-final grades (**G3**) from their earlier performance and background.
+    st.markdown()
 
-**Pipeline (per run):**
-
-1. Generate **synthetic students** in Streamlit  
-2. Load **two trained models** (`.pkl`) from **Amazon S3**  
-3. Predict G3 with **both** models and pick the **best one by RMSE**  
-4. Send all predictions in **ONE API call** to **API Gateway → Lambda**  
-5. Lambda stores the results in **Amazon S3**  
-6. This dashboard reads predictions from S3 and highlights **at‑risk students**
-        """
-    )
-
-    # ========== SIDEBAR CONFIG ==========
     st.sidebar.header("Configuration")
 
     bucket = st.sidebar.text_input("S3 Bucket (predictions)", DEFAULT_BUCKET)
@@ -251,7 +227,7 @@ final grades (**G3**) from their earlier performance and background.
         help="How many new students to generate and predict in one run.",
     )
 
-    # Load both models once (cached)
+    # Load both models once
     try:
         rf_model, gb_model = load_models(model_bucket, rf_key, gb_key)
         st.sidebar.markdown("Models loaded: **RandomForest**, **GradientBoosting**")
@@ -259,64 +235,23 @@ final grades (**G3**) from their earlier performance and background.
         st.sidebar.error(f"Error loading models from S3: {e}")
         return
 
-    # ========== DEBUG BUTTON 1: Synthetic + model.predict (no Lambda) ==========
-    if st.sidebar.button("🧪 Debug: generate & predict (no Lambda)"):
-        with st.spinner("Debug: generating 20 synthetic students and predicting..."):
-            try:
-                students = [generate_synthetic_student() for _ in range(20)]
-                df_students = pd.DataFrame(students)
-
-                st.write("Synthetic students (first 5):")
-                st.dataframe(df_students.head())
-
-                if "G3" in df_students.columns:
-                    y_true = df_students["G3"].astype(float).values
-                    X = df_students.drop(columns=["G3"])
-                else:
-                    y_true = None
-                    X = df_students
-
-                st.write("Feature columns going into model:", list(X.columns))
-                st.write("Shape of X:", X.shape)
-
-                rf_pred = rf_model.predict(X)
-                gb_pred = gb_model.predict(X)
-
-                st.write("RF predictions (first 5):", rf_pred[:5])
-                st.write("GB predictions (first 5):", gb_pred[:5])
-
-                st.success("Synthetic generation + model.predict() succeeded ✅")
-            except Exception as e:
-                st.error("Error during synthetic generation or model prediction:")
-                st.exception(e)
-
-    # ========== DEBUG BUTTON 2: Simple Lambda call ==========
-    if st.sidebar.button("🧪 Debug: send 1 simple record to Lambda"):
-        test_record = {
-            "id": "debug-1",
-            "G1": 10,
-            "G2": 12,
-            "predicted_G3": 14,
-            "model_used": "DebugModel",
-            "prediction_time": datetime.utcnow().isoformat(),
-        }
-        try:
-            status_code, text = send_predictions_via_api(api_url, [test_record])
-            st.write("Status code:", status_code)
-            st.write("Response text:", text)
-            if status_code == 200:
-                st.success("Simple Lambda test succeeded ✅")
-            else:
-                st.error("Lambda/API returned non-200 response")
-        except Exception as e:
-            st.error("Error calling Lambda/API Gateway:")
-            st.exception(e)
-
     # ========== PIPELINE BUTTON ==========
-    if st.sidebar.button("🚀 Run pipeline (Generate + Compare + Send)"):
+    if st.sidebar.button("Run pipeline(Generate + Compare + Send"):
         if not bucket or not prefix or not api_url:
             st.error("Please configure S3 Bucket, Prefix, and API URL.")
         else:
+            with st.spinner(f"Clearing previous predictions in s3://{bucket}/{prefix} ..."):
+                try:
+                    deleted = clear_s3_predictions(bucket, prefix)
+                    st.info(f"Deleted {deleted} existing prediction objects.")
+                    # Clear the cached DataFrame so we don't see old data
+                    load_s3_predictions.clear()
+                except Exception as e:
+                    st.error("Failed to clear S3 predictions (check IAM permissions).")
+                    st.exception(e)
+                    return
+
+            # Generate → Predict → Send
             with st.spinner(
                 f"Generating {int(n_new)} synthetic students and predicting G3..."
             ):
@@ -374,36 +309,26 @@ final grades (**G3**) from their earlier performance and background.
 
                     records = df_pred.to_dict(orient="records")
 
-                    # Preview of what we send
-                    st.write("Preview of first 3 records sent to Lambda:")
-                    st.json(records[:3])
-
                     # 6) ONE API CALL to Lambda
                     status_code, text = send_predictions_via_api(api_url, records)
 
-                    st.write("Lambda status code:", status_code)
-                    st.write("Lambda response body:", text)
-
                     if status_code != 200:
                         st.error(
-                            f"Lambda/API returned status {status_code}."
+                            f"Lambda/API returned status {status_code}.\n"
+                            f"Response: {text}"
                         )
                     else:
                         st.success(
                             f"Sent {len(records)} prediction records to Lambda.\n"
                             f"Best model for this batch: **{best_model_name}**"
                         )
+                        # Clear cache so dashboard reloads latest S3 data
                         load_s3_predictions.clear()
 
                 except Exception as e:
                     st.error("Error during pipeline (synthetic → predict → send):")
                     st.exception(e)
 
-    # Manual reload
-    if st.sidebar.button("🔄 Reload S3 data"):
-        load_s3_predictions.clear()
-
-    # ========== DASHBOARD VIEW ==========
     df = load_s3_predictions(bucket, prefix)
 
     if df.empty:
@@ -430,7 +355,6 @@ final grades (**G3**) from their earlier performance and background.
             help="Students with predicted G3 below the threshold.",
         )
 
-    # Show model name at top (NOT in every row)
     if "model_used" in df.columns and not df["model_used"].dropna().empty:
         last_model = df["model_used"].dropna().iloc[-1]
         st.markdown(f"**Current model used for predictions:** {last_model}")
@@ -440,7 +364,6 @@ final grades (**G3**) from their earlier performance and background.
         f"(**At‑risk:** {at_risk_count} / {total_records})"
     )
 
-    # ----- Predicted students table (sample) -----
     st.subheader("Predicted Students (sample)")
 
     base_cols = [
@@ -468,7 +391,6 @@ final grades (**G3**) from their earlier performance and background.
         use_container_width=True,
     )
 
-    # ----- At-risk students -----
     st.subheader(f"Students at risk (predicted G3 < {thresh})")
 
     if at_risk_count == 0:
@@ -482,7 +404,6 @@ final grades (**G3**) from their earlier performance and background.
             use_container_width=True,
         )
 
-        # Bar chart of lowest predicted G3
         st.markdown("#### Lowest predicted G3 (top 30)")
         fig_low = px.bar(
             at_risk_display.head(30),
@@ -494,7 +415,6 @@ final grades (**G3**) from their earlier performance and background.
         )
         st.plotly_chart(fig_low, use_container_width=True)
 
-        # ----- Factors influencing low G3 -----
         st.subheader("Factors influencing low predicted G3 (at‑risk group)")
 
         numeric_cols = at_risk_df.select_dtypes(include=[np.number]).columns.tolist()
