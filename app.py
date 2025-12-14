@@ -12,8 +12,9 @@ from datetime import datetime
 import io
 import joblib
 import requests
+import os
 
-# ===================== CONFIG =====================
+# ===================== CONFIG (defaults) =====================
 
 # Where predictions (JSON) are stored
 DEFAULT_BUCKET = "cloudprojectmodel"
@@ -27,6 +28,38 @@ DEFAULT_MODEL_BUCKET = "cloudprojectmodel"
 DEFAULT_RF_MODEL_KEY = "model/student_g3_model.pkl"
 DEFAULT_GB_MODEL_KEY = "model/student_g3_gb_predict.pkl"
 
+# ===================== LOAD SECRETS (if present) =====================
+
+# If you have .streamlit/secrets.toml like:
+# [aws]
+# AWS_ACCESS_KEY_ID = "..."
+# AWS_SECRET_ACCESS_KEY = "..."
+# AWS_REGION = "us-east-1"
+#
+# [app]
+# API_URL = "..."
+# S3_BUCKET = "cloudprojectmodel"
+# S3_PREFIX = "predictions/"
+
+try:
+    # AWS credentials from secrets -> environment variables for boto3
+    if "aws" in st.secrets:
+        aws_conf = st.secrets["aws"]
+        os.environ["AWS_ACCESS_KEY_ID"] = aws_conf["AWS_ACCESS_KEY_ID"]
+        os.environ["AWS_SECRET_ACCESS_KEY"] = aws_conf["AWS_SECRET_ACCESS_KEY"]
+        os.environ["AWS_DEFAULT_REGION"] = aws_conf.get("AWS_REGION", "us-east-1")
+
+    # Optional: override defaults from [app] section
+    if "app" in st.secrets:
+        app_conf = st.secrets["app"]
+        DEFAULT_API_URL = app_conf.get("API_URL", DEFAULT_API_URL)
+        DEFAULT_BUCKET = app_conf.get("S3_BUCKET", DEFAULT_BUCKET)
+        DEFAULT_PREFIX = app_conf.get("S3_PREFIX", DEFAULT_PREFIX)
+except Exception:
+    # If secrets are missing / misconfigured, we'll just fall back to defaults
+    pass
+
+# ===================== HELPERS =====================
 
 @st.cache_data
 def load_s3_predictions(bucket: str, prefix: str) -> pd.DataFrame:
@@ -145,6 +178,8 @@ def send_predictions_via_api(api_url: str, records: list) -> tuple[int, str]:
     return resp.status_code, resp.text
 
 
+# ===================== MAIN APP =====================
+
 def main():
     st.title("Student G3 Prediction Dashboard (Cloud Project)")
 
@@ -252,7 +287,8 @@ final grades (**G3**) from their earlier performance and background.
                 # 5) Build final DataFrame to send
                 df_pred = df_students.copy()
                 if y_true is not None:
-                    df_pred["true_G3"] = y_true  # not shown in dashboard, only for analysis
+                    # not shown in dashboard, only for internal evaluation
+                    df_pred["true_G3"] = y_true
 
                 df_pred["rf_predicted_G3"] = rf_pred
                 df_pred["gb_predicted_G3"] = gb_pred
@@ -275,7 +311,6 @@ final grades (**G3**) from their earlier performance and background.
                         f"Sent {len(records)} prediction records to Lambda.\n"
                         f"Best model for this batch: **{best_model_name}**"
                     )
-                    # We **do not** show RMSE numbers here to avoid model stats clutter.
                     # Clear cache so dashboard reloads latest S3 data
                     load_s3_predictions.clear()
 
@@ -311,7 +346,7 @@ final grades (**G3**) from their earlier performance and background.
         )
 
     # Show model name at top (NOT in every row)
-    if "model_used" in df.columns:
+    if "model_used" in df.columns and not df["model_used"].dropna().empty:
         last_model = df["model_used"].dropna().iloc[-1]
         st.markdown(f"**Current model used for predictions:** {last_model}")
 
@@ -342,7 +377,7 @@ final grades (**G3**) from their earlier performance and background.
         if c in df.columns
     ]
     display_cols = base_cols + extra_cols
-    # Note: we do NOT include 'model_used', 'true_G3', 'rf_predicted_G3', 'gb_predicted_G3'
+    # Not including 'model_used', 'true_G3', 'rf_predicted_G3', 'gb_predicted_G3'
 
     st.dataframe(
         df[display_cols].sort_values("prediction_time", ascending=False).head(50),
@@ -363,7 +398,7 @@ final grades (**G3**) from their earlier performance and background.
             use_container_width=True,
         )
 
-        # Optional: small bar chart of lowest predicted G3 (not model stats)
+        # Bar chart of lowest predicted G3
         st.markdown("#### Lowest predicted G3 (top 30)")
         fig_low = px.bar(
             at_risk_display.head(30),
