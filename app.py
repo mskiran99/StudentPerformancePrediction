@@ -25,19 +25,19 @@ DEFAULT_API_URL = "https://zmjbu0xzc7.execute-api.us-east-1.amazonaws.com/Prod/p
 
 # Where your two trained models (.pkl) are stored in S3
 DEFAULT_MODEL_BUCKET = "cloudprojectmodel"
-DEFAULT_RF_MODEL_KEY = "model/student_g3_model.pkl"
-DEFAULT_GB_MODEL_KEY = "model/student_g3_gb_predict.pkl"
+DEFAULT_RF_MODEL_KEY = "student_g3_model.pkl"
+DEFAULT_GB_MODEL_KEY = "student_g3_gb_predict.pkl"
 
 # ===================== LOAD SECRETS (if present) =====================
 
-# If you have .streamlit/secrets.toml like:
+# .streamlit/secrets.toml should look like:
 # [aws]
 # AWS_ACCESS_KEY_ID = "..."
 # AWS_SECRET_ACCESS_KEY = "..."
 # AWS_REGION = "us-east-1"
 #
 # [app]
-# API_URL = "..."
+# API_URL = "https://.../Prod/predict-stream"
 # S3_BUCKET = "cloudprojectmodel"
 # S3_PREFIX = "predictions/"
 
@@ -56,10 +56,11 @@ try:
         DEFAULT_BUCKET = app_conf.get("S3_BUCKET", DEFAULT_BUCKET)
         DEFAULT_PREFIX = app_conf.get("S3_PREFIX", DEFAULT_PREFIX)
 except Exception:
-    # If secrets are missing / misconfigured, we'll just fall back to defaults
+    # If secrets missing / misconfigured, just keep defaults
     pass
 
 # ===================== HELPERS =====================
+
 
 @st.cache_data
 def load_s3_predictions(bucket: str, prefix: str) -> pd.DataFrame:
@@ -180,6 +181,7 @@ def send_predictions_via_api(api_url: str, records: list) -> tuple[int, str]:
 
 # ===================== MAIN APP =====================
 
+
 def main():
     st.title("Student G3 Prediction Dashboard (Cloud Project)")
 
@@ -236,6 +238,59 @@ final grades (**G3**) from their earlier performance and background.
         st.sidebar.error(f"Error loading models from S3: {e}")
         return
 
+    # ========== DEBUG BUTTON 1: Synthetic + model.predict (no Lambda) ==========
+    if st.sidebar.button("🧪 Debug: generate & predict (no Lambda)"):
+        with st.spinner("Debug: generating 20 synthetic students and predicting..."):
+            try:
+                students = [generate_synthetic_student() for _ in range(20)]
+                df_students = pd.DataFrame(students)
+
+                st.write("Synthetic students (first 5):")
+                st.dataframe(df_students.head())
+
+                if "G3" in df_students.columns:
+                    y_true = df_students["G3"].astype(float).values
+                    X = df_students.drop(columns=["G3"])
+                else:
+                    y_true = None
+                    X = df_students
+
+                st.write("Feature columns going into model:", list(X.columns))
+                st.write("Shape of X:", X.shape)
+
+                rf_pred = rf_model.predict(X)
+                gb_pred = gb_model.predict(X)
+
+                st.write("RF predictions (first 5):", rf_pred[:5])
+                st.write("GB predictions (first 5):", gb_pred[:5])
+
+                st.success("Synthetic generation + model.predict() succeeded ✅")
+            except Exception as e:
+                st.error("Error during synthetic generation or model prediction:")
+                st.exception(e)
+
+    # ========== DEBUG BUTTON 2: Simple Lambda call ==========
+    if st.sidebar.button("🧪 Debug: send 1 simple record to Lambda"):
+        test_record = {
+            "id": "debug-1",
+            "G1": 10,
+            "G2": 12,
+            "predicted_G3": 14,
+            "model_used": "DebugModel",
+            "prediction_time": datetime.utcnow().isoformat(),
+        }
+        try:
+            status_code, text = send_predictions_via_api(api_url, [test_record])
+            st.write("Status code:", status_code)
+            st.write("Response text:", text)
+            if status_code == 200:
+                st.success("Simple Lambda test succeeded ✅")
+            else:
+                st.error("Lambda/API returned non-200 response")
+        except Exception as e:
+            st.error("Error calling Lambda/API Gateway:")
+            st.exception(e)
+
     # ========== PIPELINE BUTTON ==========
     if st.sidebar.button("🚀 Run pipeline (Generate + Compare + Send)"):
         if not bucket or not prefix or not api_url:
@@ -244,75 +299,84 @@ final grades (**G3**) from their earlier performance and background.
             with st.spinner(
                 f"Generating {int(n_new)} synthetic students and predicting G3..."
             ):
-                # 1) Generate synthetic students
-                n_new_int = int(n_new)
-                students = [generate_synthetic_student() for _ in range(n_new_int)]
-                df_students = pd.DataFrame(students)
+                try:
+                    # 1) Generate synthetic students
+                    n_new_int = int(n_new)
+                    students = [generate_synthetic_student() for _ in range(n_new_int)]
+                    df_students = pd.DataFrame(students)
 
-                # 2) Separate features (X) and true labels (y_true)
-                if "G3" in df_students.columns:
-                    y_true = df_students["G3"].astype(float).values
-                    X = df_students.drop(columns=["G3"])
-                else:
-                    y_true = None
-                    X = df_students
-
-                # 3) Predict with both models
-                rf_pred = rf_model.predict(X)
-                gb_pred = gb_model.predict(X)
-
-                rf_pred = np.clip(rf_pred, 0.0, 20.0).astype(float)
-                gb_pred = np.clip(gb_pred, 0.0, 20.0).astype(float)
-
-                # 4) Compute RMSE and choose best model for this batch
-                rmse_rf = rmse_gb = None
-                best_model_name = None
-                best_pred = None
-
-                if y_true is not None:
-                    rmse_rf = float(np.sqrt(((rf_pred - y_true) ** 2).mean()))
-                    rmse_gb = float(np.sqrt(((gb_pred - y_true) ** 2).mean()))
-
-                    if rmse_rf <= rmse_gb:
-                        best_model_name = "RandomForest"
-                        best_pred = rf_pred
+                    # 2) Separate features (X) and true labels (y_true)
+                    if "G3" in df_students.columns:
+                        y_true = df_students["G3"].astype(float).values
+                        X = df_students.drop(columns=["G3"])
                     else:
+                        y_true = None
+                        X = df_students
+
+                    # 3) Predict with both models
+                    rf_pred = rf_model.predict(X)
+                    gb_pred = gb_model.predict(X)
+
+                    rf_pred = np.clip(rf_pred, 0.0, 20.0).astype(float)
+                    gb_pred = np.clip(gb_pred, 0.0, 20.0).astype(float)
+
+                    # 4) Compute RMSE and choose best model for this batch
+                    rmse_rf = rmse_gb = None
+                    best_model_name = None
+                    best_pred = None
+
+                    if y_true is not None:
+                        rmse_rf = float(np.sqrt(((rf_pred - y_true) ** 2).mean()))
+                        rmse_gb = float(np.sqrt(((gb_pred - y_true) ** 2).mean()))
+
+                        if rmse_rf <= rmse_gb:
+                            best_model_name = "RandomForest"
+                            best_pred = rf_pred
+                        else:
+                            best_model_name = "GradientBoosting"
+                            best_pred = gb_pred
+                    else:
+                        # Fallback if no labels
                         best_model_name = "GradientBoosting"
                         best_pred = gb_pred
-                else:
-                    # Fallback if no labels
-                    best_model_name = "GradientBoosting"
-                    best_pred = gb_pred
 
-                # 5) Build final DataFrame to send
-                df_pred = df_students.copy()
-                if y_true is not None:
-                    # not shown in dashboard, only for internal evaluation
-                    df_pred["true_G3"] = y_true
+                    # 5) Build final DataFrame to send
+                    df_pred = df_students.copy()
+                    if y_true is not None:
+                        df_pred["true_G3"] = y_true  # internal only
 
-                df_pred["rf_predicted_G3"] = rf_pred
-                df_pred["gb_predicted_G3"] = gb_pred
-                df_pred["predicted_G3"] = best_pred
-                df_pred["model_used"] = best_model_name
-                df_pred["prediction_time"] = datetime.utcnow().isoformat()
+                    df_pred["rf_predicted_G3"] = rf_pred
+                    df_pred["gb_predicted_G3"] = gb_pred
+                    df_pred["predicted_G3"] = best_pred
+                    df_pred["model_used"] = best_model_name
+                    df_pred["prediction_time"] = datetime.utcnow().isoformat()
 
-                records = df_pred.to_dict(orient="records")
+                    records = df_pred.to_dict(orient="records")
 
-                # 6) ONE API CALL to Lambda
-                status_code, text = send_predictions_via_api(api_url, records)
+                    # Preview of what we send
+                    st.write("Preview of first 3 records sent to Lambda:")
+                    st.json(records[:3])
 
-                if status_code != 200:
-                    st.error(
-                        f"Lambda/API returned status {status_code}.\n"
-                        f"Response: {text}"
-                    )
-                else:
-                    st.success(
-                        f"Sent {len(records)} prediction records to Lambda.\n"
-                        f"Best model for this batch: **{best_model_name}**"
-                    )
-                    # Clear cache so dashboard reloads latest S3 data
-                    load_s3_predictions.clear()
+                    # 6) ONE API CALL to Lambda
+                    status_code, text = send_predictions_via_api(api_url, records)
+
+                    st.write("Lambda status code:", status_code)
+                    st.write("Lambda response body:", text)
+
+                    if status_code != 200:
+                        st.error(
+                            f"Lambda/API returned status {status_code}."
+                        )
+                    else:
+                        st.success(
+                            f"Sent {len(records)} prediction records to Lambda.\n"
+                            f"Best model for this batch: **{best_model_name}**"
+                        )
+                        load_s3_predictions.clear()
+
+                except Exception as e:
+                    st.error("Error during pipeline (synthetic → predict → send):")
+                    st.exception(e)
 
     # Manual reload
     if st.sidebar.button("🔄 Reload S3 data"):
@@ -377,7 +441,6 @@ final grades (**G3**) from their earlier performance and background.
         if c in df.columns
     ]
     display_cols = base_cols + extra_cols
-    # Not including 'model_used', 'true_G3', 'rf_predicted_G3', 'gb_predicted_G3'
 
     st.dataframe(
         df[display_cols].sort_values("prediction_time", ascending=False).head(50),
