@@ -197,7 +197,11 @@ def send_predictions_via_api(api_url: str, records: list) -> tuple[int, str]:
 def main():
     st.title("Student G3 Prediction Dashboard (Cloud Project)")
 
-    st.markdown()
+    st.markdown( """
+This dashboard uses two ML models stored in S3 to predict final grades (G3)
+and writes each fresh batch of predictions to S3 through Lambda.
+    """
+    )
 
     st.sidebar.header("Configuration")
 
