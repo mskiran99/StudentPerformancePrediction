@@ -1,43 +1,37 @@
 # app.py
+
 import streamlit as st
 import boto3
 import json
 import pandas as pd
 import numpy as np
 import plotly.express as px
-import requests
 import random
 import uuid
 from datetime import datetime
+import joblib
+import requests
 
 # ---------- CONFIG ----------
 DEFAULT_BUCKET = "cloudprojectmodel"
 DEFAULT_PREFIX = "predictions/"
+# Your API Gateway URL that invokes the Lambda above:
 DEFAULT_API_URL = "https://zmjbu0xzc7.execute-api.us-east-1.amazonaws.com/Prod/predict-stream"
-FALLBACK_MODEL = "GradientBoosting"
 
-def get_s3_client():
-    """
-    If running on Streamlit Cloud with secrets configured, use those.
-    Otherwise fall back to default boto3 client (for local/SageMaker).
-    """
-    if "aws" in st.secrets:
-        aws_cfg = st.secrets["aws"]
-        session = boto3.Session(
-            aws_access_key_id=aws_cfg["AWS_ACCESS_KEY_ID"],
-            aws_secret_access_key=aws_cfg["AWS_SECRET_ACCESS_KEY"],
-            region_name=aws_cfg.get("AWS_REGION", "us-east-1"),
-        )
-        return session.client("s3")
-    else:
-        # local environment: use default credentials / IAM role
-        return boto3.client("s3")
+BEST_MODEL_NAME = "GradientBoosting"  # or "RandomForest"
+BEST_MODEL_FILE = (
+    "student_g3_gb_predict.pkl" if BEST_MODEL_NAME == "GradientBoosting"
+    else "student_g3_model.pkl"
+)
+# -----------------------------
 
 
 @st.cache_data
 def load_s3_predictions(bucket: str, prefix: str) -> pd.DataFrame:
-    s3 = get_s3_client()
+    """Load all prediction JSONs from S3 into a DataFrame."""
+    s3 = boto3.client("s3")
     resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
+
     contents = resp.get("Contents", [])
     if not contents:
         return pd.DataFrame()
@@ -57,19 +51,20 @@ def load_s3_predictions(bucket: str, prefix: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = pd.DataFrame(rows)
-
-    # Convert time column if present
     if "prediction_time" in df.columns:
         df["prediction_time"] = pd.to_datetime(df["prediction_time"], errors="coerce")
-
     return df
 
 
+@st.cache_resource
+def load_best_model():
+    """Load the pre-trained 'best' model from local .pkl file."""
+    model = joblib.load(BEST_MODEL_FILE)
+    return model, BEST_MODEL_NAME
+
+
 def generate_synthetic_student() -> dict:
-    """
-    Generate one synthetic student with realistic fields.
-    (Treat G3 as the "true" hidden value; Lambda will output predicted_G3.)
-    """
+    """Generate one synthetic student (no true G3, only features)."""
     student = {
         "id": str(uuid.uuid4()),
         "school": random.choice(["GP", "MS"]),
@@ -104,6 +99,7 @@ def generate_synthetic_student() -> dict:
         "absences": random.randint(0, 30),
     }
 
+    # Synthetic G1, G2
     base = random.randint(8, 18)
     penalty_failures = 1.5 * student["failures"]
     penalty_absences = 0.1 * student["absences"]
@@ -116,303 +112,223 @@ def generate_synthetic_student() -> dict:
 
     G1 = clamp(score + random.randint(-2, 2))
     G2 = clamp(G1 + random.randint(-2, 2))
-    G3 = clamp(G2 + random.randint(-1, 1))
 
-    # These go to Lambda as inputs
     student["G1"] = G1
     student["G2"] = G2
-    student["G3"] = G3   # used internally; dashboard will only display predicted_G3
     return student
 
 
-def call_api_for_student(api_url: str, student: dict, model_name: str):
-    """
-    Call API Gateway for a single student using the chosen model.
-    """
-    payload = {"model_name": model_name, "student": student}
-    resp = requests.post(api_url, json=payload)
+def send_predictions_via_api(api_url: str, records: list) -> tuple[int, str]:
+    """Send predicted records to Lambda via API Gateway."""
+    payload = {"records": records}
+    resp = requests.post(api_url, json=payload, timeout=30)
     return resp.status_code, resp.text
 
 
-def infer_best_model_from_s3(df: pd.DataFrame) -> str | None:
-    """
-    Infer the best model automatically from S3 data using RMSE
-    on (true_G3 or G3) vs predicted_G3.
-
-    Returns the name of the best model, or None if cannot infer.
-    """
-    if "model_used" not in df.columns or "predicted_G3" not in df.columns:
-        return None
-
-    # Choose which column has the true grade
-    true_col = None
-    for c in ["true_G3", "G3"]:
-        if c in df.columns:
-            true_col = c
-            break
-
-    if true_col is None:
-        # No label to compute RMSE with
-        return None
-
-    metrics = []
-    for model_name, group in df.groupby("model_used"):
-        g = group.dropna(subset=["predicted_G3", true_col])
-        if g.empty:
-            continue
-        mse = ((g["predicted_G3"] - g[true_col]) ** 2).mean()
-        rmse = float(np.sqrt(mse))
-        metrics.append({"model": model_name, "rmse": rmse})
-
-    if not metrics:
-        return None
-
-    metrics_df = pd.DataFrame(metrics).sort_values("rmse")
-    return metrics_df.iloc[0]["model"]
-
-
 def main():
-    st.set_page_config(page_title="Student Performance Prediction", layout="wide")
+    st.title("Student G3 Prediction Dashboard (Cloud Project)")
 
-    st.title("Student Performance Prediction Dashboard")
-    st.caption("For School Administration – powered by AWS (Lambda, API Gateway, S3)")
+    st.markdown(
+        """
+**End-to-end Cloud Architecture**
+
+- Streamlit (this app) generates synthetic students
+- A pre-trained **ML model (.pkl)** predicts final grade G3
+- Predictions are sent to **API Gateway → Lambda**
+- Lambda stores results in **Amazon S3**
+- This dashboard reads from S3 and highlights **at-risk students**
+        """
+    )
+
+    # Load best model (.pkl) once
+    model, best_model_name = load_best_model()
 
     # ------- Sidebar -------
-    st.sidebar.header("Configuration")
+    st.sidebar.header("Settings")
 
     bucket = st.sidebar.text_input("S3 Bucket", DEFAULT_BUCKET)
     prefix = st.sidebar.text_input("S3 Prefix", DEFAULT_PREFIX)
-    api_url = st.sidebar.text_input("API URL", DEFAULT_API_URL)
+    api_url = st.sidebar.text_input("API URL (Lambda via API Gateway)", DEFAULT_API_URL)
+
+    st.sidebar.markdown(f"Using best model: **{best_model_name}**")
 
     thresh = st.sidebar.slider(
-        "At-risk threshold (Predicted G3 below)",
+        "G3 warning threshold",
         min_value=0.0,
         max_value=20.0,
         value=10.0,
         step=0.5,
+        help="Students with predicted G3 below this are flagged as 'at risk'.",
     )
 
     n_new = st.sidebar.number_input(
         "New synthetic students per run",
-        min_value=200,
-        max_value=3000,
-        value=2000,
-        step=100,
-        help="How many new students to simulate and predict in one click.",
+        min_value=10,
+        max_value=5000,
+        value=1000,
+        step=50,
+        help="How many new students to generate and predict in one run.",
     )
 
-    # Load data *before* we decide best model
-    df_raw = load_s3_predictions(bucket, prefix)
-
-    # Infer best model name from existing S3 data
-    inferred_best_model = infer_best_model_from_s3(df_raw) if not df_raw.empty else None
-
-    # If we can't infer yet (e.g., empty bucket or no labels), fall back
-    model_for_generation = inferred_best_model or FALLBACK_MODEL
-
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("**Best model (automatically selected):**")
-    st.sidebar.markdown(f"`{model_for_generation}`")
-
-    if st.sidebar.button("Generate predictions (best model only)"):
-        if not api_url:
-            st.error("Please enter API URL.")
+    if st.sidebar.button("Generate, Predict & Send via Lambda"):
+        if not bucket or not prefix or not api_url:
+            st.error("Please configure S3 Bucket, Prefix, and API URL.")
         else:
-            success = 0
-            failed = 0
             with st.spinner(
-                f"Generating {n_new} students and sending to model: {model_for_generation}..."
+                f"Generating {int(n_new)} synthetic students and predicting G3..."
             ):
-                for _ in range(int(n_new)):
-                    student = generate_synthetic_student()
-                    status_code, _ = call_api_for_student(api_url, student, model_for_generation)
-                    if 200 <= status_code < 300:
-                        success += 1
-                    else:
-                        failed += 1
+                # 1) Generate students
+                n_new_int = int(n_new)
+                students = [generate_synthetic_student() for _ in range(n_new_int)]
+                df_students = pd.DataFrame(students)
 
-            st.success(f"API calls completed. Success: {success}, Failed: {failed}")
-            if failed > 0:
-                st.warning(
-                    "Some requests failed – only successful calls will appear in S3. "
-                    "Check Lambda/API logs if the failure count is high."
-                )
+                # 2) Predict with best model
+                preds = model.predict(df_students)
+                preds = np.clip(preds, 0.0, 20.0).astype(float)
 
-            load_s3_predictions.clear()
-            df_raw = load_s3_predictions(bucket, prefix)
-            inferred_best_model = infer_best_model_from_s3(df_raw) if not df_raw.empty else inferred_best_model
-            model_for_generation = inferred_best_model or model_for_generation
+                df_students["predicted_G3"] = preds
+                df_students["model_used"] = best_model_name
+                df_students["prediction_time"] = datetime.utcnow().isoformat()
 
-    if st.sidebar.button("Reload data from S3"):
+                # 3) Send to Lambda via API Gateway
+                records = df_students.to_dict(orient="records")
+                status_code, text = send_predictions_via_api(api_url, records)
+
+                if status_code != 200:
+                    st.error(
+                        f"Lambda/API returned status {status_code}. "
+                        f"Response: {text}"
+                    )
+                else:
+                    st.success(
+                        f"Sent {len(records)} prediction records to Lambda. "
+                        f"Lambda will write them to s3://{bucket}/{prefix}"
+                    )
+                    # Clear cache so next load reads latest S3 data
+                    load_s3_predictions.clear()
+
+    if st.sidebar.button("Reload S3 data"):
         load_s3_predictions.clear()
-        df_raw = load_s3_predictions(bucket, prefix)
-        inferred_best_model = infer_best_model_from_s3(df_raw) if not df_raw.empty else inferred_best_model
-        model_for_generation = inferred_best_model or model_for_generation
 
-    # ------- If still no data, stop here -------
-    if df_raw.empty:
+    # ------- Load S3 data -------
+    df = load_s3_predictions(bucket, prefix)
+
+    if df.empty:
         st.warning(f"No prediction data found in s3://{bucket}/{prefix}")
         return
 
-    # From here on: use ALL records from S3 (all models), not filtered
-    df = df_raw.copy()
+    # ------- Top-level metrics -------
+    st.subheader("Overview")
 
-    # Treat as prediction-only: drop true G3 columns from what we show
-    for col in ["true_G3", "G3"]:
-        if col in df.columns:
-            df.drop(columns=[col], inplace=True)
+    if "predicted_G3" not in df.columns:
+        st.error("No 'predicted_G3' column found in S3 data.")
+        return
 
-    # ------- Build cleaned display DataFrame -------
-    display_cols = []
-    for c in [
-        "id",
-        "school",
-        "sex",
-        "age",
-        "studytime",
-        "failures",
-        "absences",
-        "predicted_G3",
-        "prediction_time",
-        # note: we intentionally skip 'model_used' to not show it row-by-row
-    ]:
-        if c in df.columns:
-            display_cols.append(c)
+    total_records = len(df)
+    at_risk_df = df[df["predicted_G3"] < thresh]
+    at_risk_count = len(at_risk_df)
 
-    if not display_cols:
-        display_cols = df.columns.tolist()
-
-    df_display = df[display_cols].copy()
-
-    # Rename predicted_G3 column label for clarity
-    if "predicted_G3" in df_display.columns:
-        df_display = df_display.rename(columns={"predicted_G3": "Predicted G3"})
-
-    # Sort by most recent
-    if "prediction_time" in df_display.columns:
-        df_display = df_display.sort_values("prediction_time", ascending=False)
-
-    # ------- Top KPIs (total records, at-risk count) -------
-    total_records = len(df_display)
-    if "Predicted G3" in df_display.columns:
-        at_risk_mask = df_display["Predicted G3"] < thresh
-        at_risk_count = int(at_risk_mask.sum())
-    else:
-        at_risk_mask = pd.Series([False] * len(df_display), index=df_display.index)
-        at_risk_count = 0
-
-    best_model_for_view = inferred_best_model or model_for_generation
-
-    col1, col2, col3 = st.columns(3)
-
+    col1, col2 = st.columns(2)
     with col1:
-        st.metric("Best Model in Use", str(best_model_for_view))
-
+        st.metric("Total predicted students", total_records)
     with col2:
-        st.metric("Total Students (predicted)", total_records)
-
-    with col3:
         st.metric(
-            "Students At Risk",
-            f"{at_risk_count} / {total_records}" if total_records > 0 else "0 / 0",
+            "At‑risk students",
+            f"{at_risk_count} / {total_records}",
+            help="Number of students with predicted G3 below the threshold.",
         )
 
-    st.markdown("---")
+    st.markdown(
+        f"**Current G3 warning threshold:** {thresh} &nbsp;&nbsp; "
+        f"(**At‑risk:** {at_risk_count} / {total_records})"
+    )
 
-    # ------- Overall predictions table -------
-    st.subheader("Latest Predictions")
-    st.dataframe(df_display.head(500), use_container_width=True)
+    # ------- Predicted students sample -------
+    st.subheader("Predicted Students (sample)")
 
-    # ------- Grade distribution -------
-    if "Predicted G3" in df_display.columns:
-        st.subheader("Grade Distribution (Predicted G3)")
-        fig_hist = px.histogram(
-            df_display,
-            x="Predicted G3",
-            nbins=20,
-            title="Distribution of Predicted Final Grades",
-        )
-        fig_hist.update_layout(margin=dict(l=10, r=10, t=40, b=10))
-        st.plotly_chart(fig_hist, use_container_width=True)
-
-    # ------- At-Risk Students Section -------
-    st.subheader(f"Students Below Threshold (Predicted G3 < {thresh})")
-
-    if "Predicted G3" in df_display.columns:
-        at_risk_df = df_display[df_display["Predicted G3"] < thresh].copy()
-    else:
-        at_risk_df = pd.DataFrame()
-
-    if at_risk_df.empty:
-        st.success("No students are currently below the selected G3 threshold.")
-    else:
-        st.info(f"Showing {len(at_risk_df)} at-risk students out of {total_records} total.")
-
-        # Show a clean, admin-friendly table
-        show_cols = [
+    base_cols = [
+        c
+        for c in [
             "id",
             "school",
+            "sex",
             "age",
-            "studytime",
-            "failures",
-            "absences",
-            "Predicted G3",
+            "G1",
+            "G2",
+            "predicted_G3",
             "prediction_time",
         ]
-        show_cols = [c for c in show_cols if c in at_risk_df.columns]
+        if c in df.columns
+    ]
+    extra_cols = [
+        c for c in ["studytime", "failures", "absences", "Dalc", "Walc"]
+        if c in df.columns
+    ]
+    display_cols = base_cols + extra_cols
 
+    st.dataframe(
+        df[display_cols].sort_values("prediction_time", ascending=False).head(50),
+        use_container_width=True,
+    )
+
+    # ------- At-risk students -------
+    st.subheader(f"Students at risk (predicted G3 < {thresh})")
+
+    if at_risk_count == 0:
+        st.success("No at‑risk students under the current threshold. 🎉")
+    else:
+        st.write(f"Total at‑risk students: **{at_risk_count}**")
+
+        at_risk_display = at_risk_df.sort_values("predicted_G3").head(100)
         st.dataframe(
-            at_risk_df[show_cols].sort_values("Predicted G3").head(300),
+            at_risk_display[display_cols],
             use_container_width=True,
         )
 
-        # Simple bar chart showing lowest predicted G3 values
+        st.markdown("#### Lowest predicted G3")
         fig_low = px.bar(
-            at_risk_df.sort_values("Predicted G3").head(30),
-            x="id" if "id" in at_risk_df.columns else at_risk_df.index.astype(str),
-            y="Predicted G3",
-            title="Lowest Predicted G3 (Top 30 Students)",
+            at_risk_display.head(30),
+            x="id"
+            if "id" in at_risk_display.columns
+            else at_risk_display.index.astype(str),
+            y="predicted_G3",
+            title="Students with lowest predicted G3 (top 30)",
         )
-        fig_low.update_layout(margin=dict(l=10, r=10, t=40, b=10))
         st.plotly_chart(fig_low, use_container_width=True)
 
-    # ------- Factors Affecting Low Predicted G3 -------
-    st.subheader("📌 Factors Affecting Low Predicted G3 Scores")
+        # ------- Factors influencing low G3 -------
+        st.subheader("Factors influencing low predicted G3")
 
-    if at_risk_df.empty or "Predicted G3" not in at_risk_df.columns:
-        st.info("No at-risk students available — cannot compute influencing factors.")
-    else:
-        # Use only numeric columns
         numeric_cols = at_risk_df.select_dtypes(include=[np.number]).columns.tolist()
+        numeric_cols = [c for c in numeric_cols if c not in ["predicted_G3"]]
 
-        # Remove target column from predictors
-        if "Predicted G3" in numeric_cols:
-            numeric_cols.remove("Predicted G3")
-
-        if not numeric_cols:
-            st.info("No numeric features available to compute correlations.")
-        else:
-            # Compute correlation with Predicted G3
-            corr = at_risk_df[numeric_cols + ["Predicted G3"]].corr()["Predicted G3"].dropna()
-
-            # Sort strongest relationship first
-            corr = corr.reindex(corr.abs().sort_values(ascending=False).index)
-
+        if numeric_cols:
+            corr = (
+                at_risk_df[numeric_cols + ["predicted_G3"]]
+                .corr()["predicted_G3"]
+                .drop("predicted_G3")
+            )
+            corr = corr.sort_values(key=lambda x: -np.abs(x))
             corr_df = corr.reset_index()
-            corr_df.columns = ["Feature", "Correlation With Predicted G3"]
+            corr_df.columns = ["feature", "corr_with_predicted_G3"]
 
-            st.write("Top factors correlated with poor performance:")
-            st.dataframe(corr_df.head(10), use_container_width=True)
+            st.write(
+                "Higher absolute correlation means that feature is more strongly "
+                "associated with lower/higher predicted G3 within the at‑risk group."
+            )
+            st.dataframe(corr_df.head(15), use_container_width=True)
 
             fig_corr = px.bar(
-                corr_df.head(10),
-                x="Correlation With Predicted G3",
-                y="Feature",
-                orientation="h",
-                title="Most Influential Factors in Low Performance",
+                corr_df.head(15),
+                x="feature",
+                y="corr_with_predicted_G3",
+                title="Top factors correlated with predicted G3 (at‑risk students)",
             )
-            fig_corr.update_layout(margin=dict(l=20, r=20, t=40, b=20))
             st.plotly_chart(fig_corr, use_container_width=True)
+        else:
+            st.info(
+                "Not enough numeric features to compute correlations for at‑risk students."
+            )
 
 
 if __name__ == "__main__":
