@@ -64,7 +64,11 @@ except Exception:
 
 @st.cache_data
 def load_s3_predictions(bucket: str, prefix: str) -> pd.DataFrame:
-    """Load all prediction JSONs from S3 into a DataFrame."""
+    """Load all prediction JSONs from S3 into a DataFrame.
+    Supports:
+    - Old format: each object is a single dict
+    - New format: each object is a list of dicts (batch)
+    """
     s3 = boto3.client("s3")
     resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
 
@@ -72,16 +76,31 @@ def load_s3_predictions(bucket: str, prefix: str) -> pd.DataFrame:
     if not contents:
         return pd.DataFrame()
 
-    rows = []
+    rows: list[dict] = []
+
     for obj in contents:
         key = obj["Key"]
         if key.endswith("/"):
-            continue
+            continue  # skip "folder" keys
+
         body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+
         try:
-            rows.append(json.loads(body))
+            data = json.loads(body)
         except Exception:
+            # skip badly formatted JSON
             continue
+
+        # New format: file contains a list of dicts
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    rows.append(item)
+            continue
+
+        # Old format: file contains a single dict
+        if isinstance(data, dict):
+            rows.append(data)
 
     if not rows:
         return pd.DataFrame()
@@ -89,7 +108,9 @@ def load_s3_predictions(bucket: str, prefix: str) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     if "prediction_time" in df.columns:
         df["prediction_time"] = pd.to_datetime(df["prediction_time"], errors="coerce")
+
     return df
+
 
 
 @st.cache_resource
