@@ -24,8 +24,8 @@ DEFAULT_API_URL = "https://zmjbu0xzc7.execute-api.us-east-1.amazonaws.com/Prod/p
 
 # Where your two trained models (.pkl) are stored in S3
 DEFAULT_MODEL_BUCKET = "cloudprojectmodel"
-DEFAULT_RF_MODEL_KEY = "student_g3_model.pkl"
-DEFAULT_GB_MODEL_KEY = "student_g3_gb_predict.pkl"
+DEFAULT_RF_MODEL_KEY = "model/student_g3_model.pkl"
+DEFAULT_GB_MODEL_KEY = "model/student_g3_gb_predict.pkl"
 
 
 @st.cache_data
