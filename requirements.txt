@@ -2,5 +2,7 @@ streamlit
 boto3
 pandas
 numpy
+scikit-learn
+joblib
 plotly
 requests
