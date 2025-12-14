@@ -24,8 +24,8 @@ DEFAULT_API_URL = "https://zmjbu0xzc7.execute-api.us-east-1.amazonaws.com/Prod/p
 
 # Where your two trained models (.pkl) are stored in S3
 DEFAULT_MODEL_BUCKET = "cloudprojectmodel"
-DEFAULT_RF_MODEL_KEY = "model/student_g3_model.pkl"
-DEFAULT_GB_MODEL_KEY = "model/student_g3_gb_predict.pkl"
+DEFAULT_RF_MODEL_KEY = "student_g3_model.pkl"
+DEFAULT_GB_MODEL_KEY = "student_g3_gb_predict.pkl"
 
 
 @st.cache_data
@@ -196,7 +196,7 @@ final grades (**G3**) from their earlier performance and background.
     # Load both models once (cached)
     try:
         rf_model, gb_model = load_models(model_bucket, rf_key, gb_key)
-        st.sidebar.markdown("🧠 Models loaded: **RandomForest**, **GradientBoosting**")
+        st.sidebar.markdown("Models loaded: **RandomForest**, **GradientBoosting**")
     except Exception as e:
         st.sidebar.error(f"Error loading models from S3: {e}")
         return
