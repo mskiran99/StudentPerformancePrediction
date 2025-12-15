@@ -1,4 +1,4 @@
-Student Performance Prediction Using AWS Cloud
+## Student Performance Prediction Using AWS Cloud
 
 A cloud‑native, **serverless machine learning pipeline** to predict student academic performance using the **UCI Student Performance Dataset** and visualize at‑risk students through a **Streamlit dashboard**.
 
