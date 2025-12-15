@@ -46,7 +46,7 @@ def load_data(bucket: str, prefix: str) -> pd.DataFrame:
 
 
 def main():
-    st.title("📊 Student Performance Prediction Dashboard")
+    st.title("Student Performance Prediction Dashboard")
     st.markdown(
         "Visualizing **predicted final grade (G3)** from our cloud streaming pipeline."
     )
@@ -56,7 +56,7 @@ def main():
     bucket = st.sidebar.text_input("S3 Bucket", DEFAULT_BUCKET)
     prefix = st.sidebar.text_input("Prefix (folder)", DEFAULT_PREFIX)
 
-    if st.sidebar.button("🔄 Reload data"):
+    if st.sidebar.button("Reload data"):
         st.cache_data.clear()
 
     df = load_data(bucket, prefix)
