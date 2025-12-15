@@ -196,22 +196,12 @@ def send_predictions_via_api(api_url: str, records: list) -> tuple[int, str]:
     return resp.status_code, resp.text
 
 def main():
-    st.title("Student G3 Prediction Dashboard (Cloud Project)")
+    st.title("Student Grade Prediction Dashboard")
 
     st.markdown(
         """
 This dashboard uses **two ML models** (stored in S3) to predict students'
 final grades (**G3**) from their earlier performance and background.
-
-**Pipeline (per run):**
-
-1. Clear previous prediction files in **S3** (fresh batch)  
-2. Generate **synthetic students** in Streamlit  
-3. Load **two trained models** (`.pkl`) from **Amazon S3**  
-4. Predict G3 with **both** models and pick the **best one by RMSE**  
-5. Send all predictions in **ONE API call** to **API Gateway → Lambda**  
-6. Lambda stores the results in **Amazon S3**  
-7. This dashboard reads predictions from S3 and highlights **at‑risk students**
         """
     )
 
